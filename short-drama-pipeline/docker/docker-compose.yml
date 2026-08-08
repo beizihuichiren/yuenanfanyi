@@ -1,0 +1,7 @@
+services:
+  subtitle-remover:
+    image: eritpchy/video-subtitle-remover:1.1.1-cuda12.8
+    container_name: subtitle-remover
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all

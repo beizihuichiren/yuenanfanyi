@@ -1,0 +1,469 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>短剧越南语转译流水线</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+  </head>
+  <body>
+    <div class="app">
+      <header>
+        <h1>短剧越南语转译流水线</h1>
+        <p class="subtitle">上传视频 → 提取音频 → ASR转写 → AI纠错 → 翻译 → AI校对 → 消字幕 → 烧录 → 质检</p>
+      </header>
+
+      <!-- 配置区 -->
+      <section class="panel config-panel">
+        <div class="panel-header">
+          <h2>⚙️ 服务配置</h2>
+          <button id="toggleConfig" class="btn-ghost">收起</button>
+        </div>
+        <div id="configBody" class="config-body">
+          <div class="config-grid">
+            <div class="config-item">
+              <label>ASR 引擎</label>
+              <select id="cfgAsrBackend">
+                <option value="funasr">FunASR (中文专用, 推荐)</option>
+                <option value="whisper">Whisper (多语言)</option>
+                <option value="openai_api">OpenAI Whisper API</option>
+              </select>
+            </div>
+            <div class="config-item">
+              <label>Whisper 模型大小</label>
+              <select id="cfgWhisperModel">
+                <option value="small">small (快速)</option>
+                <option value="medium">medium (平衡)</option>
+                <option value="large-v3">large-v3 (精准)</option>
+              </select>
+            </div>
+            <div class="config-item">
+              <label>DeepSeek API Key</label>
+              <input type="password" id="cfgApiKey" placeholder="sk-..." />
+              <span id="cfgKeyHint" class="hint"></span>
+            </div>
+            <div class="config-item">
+              <label>API Base URL</label>
+              <input type="text" id="cfgApiBase" placeholder="https://api.deepseek.com/v1" />
+            </div>
+            <div class="config-item">
+              <label>翻译模型</label>
+              <input type="text" id="cfgModel" placeholder="deepseek-chat" />
+            </div>
+            <div class="config-item">
+              <label>代理端口</label>
+              <input type="text" id="cfgProxyPort" placeholder="7892" />
+            </div>
+          </div>
+          <div class="config-actions">
+            <button id="saveConfigBtn" class="btn-primary">保存配置</button>
+            <button id="testConfigBtn" class="btn-secondary">测试 API 连通</button>
+            <span id="configStatus" class="hint"></span>
+          </div>
+        </div>
+      </section>
+
+      <!-- 上传区 -->
+      <section class="panel">
+        <div class="panel-header">
+          <h2>1. 上传视频</h2>
+        </div>
+        <div class="upload-area" id="uploadArea">
+          <input type="file" id="videoFile" accept="video/mp4,video/x-matroska,video/quicktime,video/x-flv,video/x-msvideo" hidden />
+          <div class="upload-placeholder">
+            <div class="upload-icon">📁</div>
+            <p>点击选择视频文件 或拖拽到此处</p>
+            <p class="hint">支持 MP4 / MKV / MOV / FLV / AVI</p>
+          </div>
+        </div>
+        <div id="uploadInfo" class="file-info"></div>
+      </section>
+
+      <!-- 启动流水线 -->
+      <section class="panel">
+        <div class="panel-header">
+          <h2>2. 启动流水线</h2>
+        </div>
+        <div class="form-grid">
+          <div>
+            <label class="field">视频文件名</label>
+            <input type="text" id="videoRef" placeholder="上传后自动填入, 或手填 uploads 中的文件名" />
+          </div>
+          <div>
+            <label class="field">剧集标识</label>
+            <input type="text" id="episodeTag" placeholder="例如: 霸总_EP01" />
+          </div>
+        </div>
+        <div class="actions">
+          <button id="startBtn" class="btn-primary">🚀 启动流水线</button>
+          <button id="refreshBtn" class="btn-secondary">🔄 刷新任务</button>
+        </div>
+        <div class="hint" style="margin-top:10px;">
+          流程: 提取音频 → ASR转写 → AI纠错 → 清洗 → 翻译 → AI校对 → 消字幕 → 烧录 → 质检
+        </div>
+      </section>
+
+      <!-- 任务列表 -->
+      <section class="panel">
+        <div class="panel-header">
+          <h2>3. 任务列表</h2>
+        </div>
+        <div id="taskList">
+          <p class="empty">暂无任务</p>
+        </div>
+      </section>
+    </div>
+
+    <!-- 任务详情弹窗 -->
+    <div id="detailModal" class="modal" hidden>
+      <div class="modal-content">
+        <div class="modal-header">
+          <h2 id="detailTitle">任务详情</h2>
+          <button id="closeModal" class="btn-ghost">✕</button>
+        </div>
+        <div class="modal-body" id="detailBody">
+          <p class="empty">加载中...</p>
+        </div>
+      </div>
+    </div>
+
+    <div id="toast" class="toast"></div>
+
+    <script>
+      // ---------- 通用工具 ----------
+      function toast(msg, isError = false) {
+        const el = document.getElementById('toast');
+        el.textContent = msg;
+        el.classList.toggle('error', isError);
+        el.classList.add('show');
+        setTimeout(() => el.classList.remove('show'), 3000);
+      }
+
+      function fmtSize(bytes) {
+        if (!bytes) return '0 B';
+        const u = ['B', 'KB', 'MB', 'GB'];
+        const i = Math.floor(Math.log(bytes) / Math.log(1024));
+        return (bytes / Math.pow(1024, i)).toFixed(1) + ' ' + u[i];
+      }
+
+      function fmtTime(ts) {
+        if (!ts) return '-';
+        const d = new Date(ts * 1000);
+        return d.toLocaleString();
+      }
+
+      function fmtSrtTime(sec) {
+        if (sec == null) return '';
+        const h = Math.floor(sec / 3600);
+        const m = Math.floor((sec % 3600) / 60);
+        const s = Math.floor(sec % 60);
+        const ms = Math.floor((sec % 1) * 1000);
+        return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')},${String(ms).padStart(3,'0')}`;
+      }
+
+      function statusLabel(s) {
+        const map = {
+          pending: '排队中', extracting: '提取音频', transcribing: '转写中',
+          cleaning: '清洗中', translating: '翻译中', reviewing: 'AI校对中',
+          awaiting_review: '待审核', applying: '应用审核', removing: '消字幕中',
+          merging: '烧录字幕', quality: '终检中', done: '✓ 已完成', error: '✗ 失败',
+          running: '运行中',
+        };
+        return map[s] || s;
+      }
+
+      function statusClass(s) {
+        if (s === 'done') return 'done';
+        if (s === 'error') return 'error';
+        if (s === 'awaiting_review') return 'warn';
+        return 'running';
+      }
+
+      // 阶段流程定义
+      const STAGES = [
+        {key:'extracting', label:'提取音频', icon:'🎵'},
+        {key:'transcribing', label:'ASR转写', icon:'🎤'},
+        {key:'cleaning', label:'清洗纠错', icon:'🧹'},
+        {key:'translating', label:'翻译', icon:'🌐'},
+        {key:'reviewing', label:'AI校对', icon:'✏️'},
+        {key:'removing', label:'消字幕', icon:'🩹'},
+        {key:'merging', label:'烧录', icon:'🔥'},
+        {key:'quality', label:'质检', icon:'✅'},
+      ];
+
+      function renderStageFlow(status) {
+        const stageOrder = ['extracting','transcribing','cleaning','translating','reviewing','removing','merging','quality'];
+        const currentIdx = stageOrder.indexOf(status.stage);
+        return `<div class="stage-flow">${STAGES.map((st, i) => {
+          let cls = '';
+          if (status.status === 'done' || (currentIdx >= 0 && i < currentIdx)) cls = 'done';
+          else if (currentIdx === i) cls = 'active';
+          return `<div class="stage ${cls}"><span class="stage-icon">${st.icon}</span><span class="stage-label">${st.label}</span></div>`;
+        }).join('<div class="stage-arrow">→</div>')}</div>`;
+      }
+
+      // ---------- 配置 ----------
+      async function loadConfig() {
+        try {
+          const res = await fetch('/api/config');
+          const cfg = await res.json();
+          document.getElementById('cfgAsrBackend').value = cfg.asr_backend || 'funasr';
+          document.getElementById('cfgWhisperModel').value = cfg.whisper_model_size || 'large-v3';
+          document.getElementById('cfgApiKey').value = cfg.openai_api_key || '';
+          document.getElementById('cfgApiBase').value = cfg.openai_api_base || '';
+          document.getElementById('cfgModel').value = cfg.openai_model || '';
+          document.getElementById('cfgProxyPort').value = cfg.proxy_port || '';
+          document.getElementById('cfgKeyHint').textContent = cfg.openai_api_key_masked ? `当前: ${cfg.openai_api_key_masked}` : '';
+        } catch (e) { console.error(e); }
+      }
+
+      document.getElementById('saveConfigBtn').addEventListener('click', async () => {
+        const cfg = {
+          asr_backend: document.getElementById('cfgAsrBackend').value,
+          whisper_model_size: document.getElementById('cfgWhisperModel').value,
+          openai_api_key: document.getElementById('cfgApiKey').value,
+          openai_api_base: document.getElementById('cfgApiBase').value,
+          openai_model: document.getElementById('cfgModel').value,
+          proxy_port: document.getElementById('cfgProxyPort').value,
+        };
+        try {
+          const res = await fetch('/api/config', {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify(cfg),
+          });
+          const data = await res.json();
+          if (res.ok) { toast('配置已保存'); loadConfig(); }
+          else toast(data.error || '保存失败', true);
+        } catch (e) { toast('保存异常: ' + e.message, true); }
+      });
+
+      document.getElementById('testConfigBtn').addEventListener('click', async () => {
+        const btn = document.getElementById('testConfigBtn');
+        const statusEl = document.getElementById('configStatus');
+        btn.disabled = true; btn.textContent = '测试中...';
+        statusEl.textContent = '';
+        try {
+          const res = await fetch('/api/config/test', {method:'POST'});
+          const data = await res.json();
+          if (data.ok) { statusEl.textContent = '✓ 连通成功: ' + (data.reply || ''); statusEl.className = 'hint ok'; }
+          else { statusEl.textContent = '✗ ' + (data.error || '失败'); statusEl.className = 'hint err'; }
+        } catch (e) { statusEl.textContent = '✗ ' + e.message; statusEl.className = 'hint err'; }
+        btn.disabled = false; btn.textContent = '测试 API 连通';
+      });
+
+      document.getElementById('toggleConfig').addEventListener('click', () => {
+        const body = document.getElementById('configBody');
+        const btn = document.getElementById('toggleConfig');
+        if (body.hidden) { body.hidden = false; btn.textContent = '收起'; }
+        else { body.hidden = true; btn.textContent = '展开'; }
+      });
+
+      // ---------- 上传 ----------
+      const uploadArea = document.getElementById('uploadArea');
+      const fileInput = document.getElementById('videoFile');
+
+      uploadArea.addEventListener('click', () => fileInput.click());
+      uploadArea.addEventListener('dragover', (e) => { e.preventDefault(); uploadArea.classList.add('drag'); });
+      uploadArea.addEventListener('dragleave', () => uploadArea.classList.remove('drag'));
+      uploadArea.addEventListener('drop', (e) => {
+        e.preventDefault(); uploadArea.classList.remove('drag');
+        if (e.dataTransfer.files.length) { fileInput.files = e.dataTransfer.files; uploadVideo(); }
+      });
+      fileInput.addEventListener('change', () => { if (fileInput.files.length) uploadVideo(); });
+
+      async function uploadVideo() {
+        if (!fileInput.files.length) return;
+        const formData = new FormData();
+        formData.append('video', fileInput.files[0]);
+        document.getElementById('uploadInfo').textContent = '上传中...';
+        try {
+          const res = await fetch('/api/upload', { method: 'POST', body: formData });
+          const data = await res.json();
+          if (!res.ok) { toast(data.error || '上传失败', true); return; }
+          document.getElementById('videoRef').value = data.filename;
+          document.getElementById('episodeTag').value = data.original_name.replace(/\.[^.]+$/, '');
+          document.getElementById('uploadInfo').innerHTML =
+            `✓ 已上传: <b>${data.original_name}</b> → ${data.filename} (${fmtSize(data.size)})`;
+          toast('上传成功');
+        } catch (e) { toast('上传异常: ' + e.message, true); }
+      }
+
+      // ---------- 启动流水线 ----------
+      document.getElementById('startBtn').addEventListener('click', async () => {
+        const payload = {
+          video: document.getElementById('videoRef').value.trim(),
+          episode_tag: document.getElementById('episodeTag').value.trim(),
+        };
+        if (!payload.video) { toast('请填写视频文件名', true); return; }
+        if (!payload.episode_tag) { toast('请填写剧集标识', true); return; }
+        try {
+          const res = await fetch('/api/pipeline/start', {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify(payload),
+          });
+          const data = await res.json();
+          if (!res.ok) { toast(data.error || '启动失败', true); return; }
+          toast('流水线已启动: ' + data.task_id);
+          fetchTasks();
+        } catch (e) { toast('启动异常: ' + e.message, true); }
+      });
+
+      // ---------- 任务列表 ----------
+      let pollTimer = null;
+      async function fetchTasks() {
+        try {
+          const res = await fetch('/api/pipeline/tasks');
+          const tasks = await res.json();
+          renderTasks(tasks);
+          const hasRunning = tasks.some(t => !['done','error'].includes(t.status));
+          if (hasRunning && !pollTimer) pollTimer = setInterval(fetchTasks, 2000);
+          else if (!hasRunning && pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+        } catch (e) { console.error(e); }
+      }
+
+      function renderTasks(tasks) {
+        const list = document.getElementById('taskList');
+        if (!tasks.length) { list.innerHTML = '<p class="empty">暂无任务</p>'; return; }
+        tasks.sort((a, b) => b.started_at - a.started_at);
+        list.innerHTML = tasks.map(t => {
+          const pct = Math.max(0, Math.min(100, t.progress || 0));
+          const sClass = statusClass(t.status);
+          const artifacts = t.artifacts || {};
+          const isVideo = (k) => {
+            const v = artifacts[k];
+            return typeof v === 'string' && /\.(mp4|mkv|mov|webm)$/i.test(v);
+          };
+          const artifactKeys = Object.keys(artifacts).filter(k => typeof artifacts[k] === 'string');
+          const labels = {cn_srt:'中文字幕', vi_srt_v1:'越南语初译', vi_srt_final:'越南语终版',
+                          review_docx:'审核稿', reviewed_docx:'已审核稿', review_note:'校对意见',
+                          clean_video:'消字幕视频', final_video:'越南语成片',
+                          quality_report:'质检报告', audio:'音频', video:'原始视频', raw_video:'归档片源'};
+          const artifactLinks = artifactKeys.map(k => {
+            const label = labels[k] || k;
+            const isVid = isVideo(k);
+            const isAud = /\.(wav|mp3|aac|m4a|flac)$/i.test(artifacts[k]);
+            const canPreview = isVid || isAud || /\.(srt|txt|md|json)$/i.test(artifacts[k]);
+            const fileType = isVid ? 'video' : (isAud ? 'audio' : 'text');
+            const previewAttr = canPreview ? `onclick="openPreview('${t.task_id}','${k}','${fileType}');return false;"` : '';
+            const href = canPreview ? '#' : `/api/pipeline/tasks/${t.task_id}/artifacts/${k}`;
+            return `<a href="${href}" ${previewAttr} class="artifact-link ${isVid ? 'video-link' : ''}">${label}</a>`;
+          }).join('');
+
+          const errLine = t.status === 'error' && t.error
+            ? `<div class="err-msg">错误: ${t.error}</div>` : '';
+
+          return `
+            <article class="task-card ${sClass}">
+              <div class="task-header" onclick="toggleDetail('${t.task_id}')">
+                <div class="task-title">
+                  <span class="task-name">${t.episode_tag}</span>
+                  <span class="status-pill ${sClass}">${statusLabel(t.status)}</span>
+                </div>
+                <div class="task-meta">任务 ${t.task_id} · ${fmtTime(t.started_at)}</div>
+              </div>
+              <div class="task-stage">${renderStageFlow(t)}</div>
+              <div class="task-progress">
+                <span class="progress-text">${statusLabel(t.stage || t.status)} · ${t.message || ''}</span>
+                <div class="progress-bar"><div style="width:${pct}%"></div></div>
+                <span class="progress-pct">${pct}%</span>
+              </div>
+              ${errLine}
+              <div class="artifact-list" onclick="event.stopPropagation()">${artifactLinks}</div>
+              <div class="task-detail-toggle" onclick="toggleDetail('${t.task_id}')">查看详情 ▾</div>
+            </article>
+          `;
+        }).join('');
+      }
+
+      // ---------- 详情弹窗 ----------
+      async function toggleDetail(taskId) {
+        const modal = document.getElementById('detailModal');
+        const body = document.getElementById('detailBody');
+        const title = document.getElementById('detailTitle');
+        modal.hidden = false;
+        title.textContent = '任务详情';
+        body.innerHTML = '<p class="empty">加载中...</p>';
+        try {
+          const res = await fetch(`/api/pipeline/tasks/${taskId}/detail`);
+          const d = await res.json();
+          if (!res.ok) { body.innerHTML = `<p class="err-msg">${d.error}</p>`; return; }
+          title.textContent = `${d.episode_tag} - 任务详情`;
+
+          let html = '';
+
+          // 转写文本对比
+          if (d.transcript_raw) {
+            html += `<div class="detail-section"><h3>📝 ASR 转写原文</h3><pre class="text-block">${escapeHtml(d.transcript_raw)}</pre></div>`;
+          }
+          if (d.transcript_corrected && d.transcript_corrected !== d.transcript_raw) {
+            html += `<div class="detail-section"><h3>✏️ AI 纠错后</h3><pre class="text-block corrected">${escapeHtml(d.transcript_corrected)}</pre></div>`;
+          }
+
+          // 中越字幕对照
+          if (d.subtitle_pairs && d.subtitle_pairs.length) {
+            html += `<div class="detail-section"><h3>🌐 中越字幕对照 (${d.subtitle_pairs.length} 条)</h3>`;
+            html += `<table class="subtitle-table"><thead><tr><th>#</th><th>时间</th><th>中文</th><th>越南语</th></tr></thead><tbody>`;
+            d.subtitle_pairs.forEach(p => {
+              html += `<tr><td>${p.index}</td><td class="ts">${fmtSrtTime(p.start)}<br>--><br>${fmtSrtTime(p.end)}</td><td class="cn">${escapeHtml(p.cn)}</td><td class="vi">${escapeHtml(p.vi)}</td></tr>`;
+            });
+            html += `</tbody></table></div>`;
+          }
+
+          if (!html) html = '<p class="empty">暂无详情数据</p>';
+          body.innerHTML = html;
+        } catch (e) { body.innerHTML = `<p class="err-msg">加载失败: ${e.message}</p>`; }
+      }
+
+      function escapeHtml(s) {
+        if (!s) return '';
+        return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      }
+
+      // ---------- 视频预览 ----------
+      async function openPreview(taskId, key, type) {
+        const modal = document.getElementById('detailModal');
+        const body = document.getElementById('detailBody');
+        const title = document.getElementById('detailTitle');
+        modal.hidden = false;
+        title.textContent = '预览: ' + key;
+        const url = `/api/pipeline/tasks/${taskId}/preview/${key}`;
+
+        // 视频文件
+        if (type === 'video') {
+          body.innerHTML = `<div class="preview-wrap"><video src="${url}" controls autoplay style="width:100%;max-height:70vh"></video></div>`;
+          return;
+        }
+
+        // 音频文件
+        if (type === 'audio') {
+          body.innerHTML = `<div class="preview-wrap"><audio src="${url}" controls style="width:100%"></audio></div>`;
+          return;
+        }
+
+        // 文本类
+        try {
+          const res = await fetch(url);
+          const text = await res.text();
+          body.innerHTML = `<div class="detail-section"><pre class="text-block" style="max-height:65vh">${escapeHtml(text)}</pre></div>`;
+        } catch (e) { body.innerHTML = `<p class="err-msg">加载失败: ${e.message}</p>`; }
+      }
+
+      document.getElementById('closeModal').addEventListener('click', () => {
+        document.getElementById('detailModal').hidden = true;
+        document.getElementById('detailBody').innerHTML = '';
+      });
+      document.getElementById('detailModal').addEventListener('click', (e) => {
+        if (e.target.id === 'detailModal') {
+          document.getElementById('detailModal').hidden = true;
+          document.getElementById('detailBody').innerHTML = '';
+        }
+      });
+
+      document.getElementById('refreshBtn').addEventListener('click', fetchTasks);
+
+      // ---------- 初始化 ----------
+      loadConfig();
+      fetchTasks();
+    </script>
+  </body>
+</html>

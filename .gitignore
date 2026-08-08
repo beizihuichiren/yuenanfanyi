@@ -1,0 +1,27 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# 敏感配置（含 API Key）
+.env
+review-web/data/config.json
+
+# 运行产物与缓存
+output/
+modelscope_cache/
+*.log
+push-*.log
+
+# FFmpeg 二进制与临时解压目录（容器内通过 apt 安装，无需提交）
+ffmpeg/
+
+# 运行产物文件
+prod_*.md
+
+# 测试视频与大型二进制
+*.mp4
+testsuorse/
+
+# 文档源文件
+*.docx

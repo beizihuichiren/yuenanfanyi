@@ -1,0 +1,42 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.egg-info/
+
+# 本地 FFmpeg 二进制（镜像内已装系统 FFmpeg）
+ffmpeg/
+
+# 测试与素材（镜像不需要）
+tests/
+testsuorse/
+test*/
+*.test.mp4
+
+# 输出与缓存（运行时挂载卷）
+output/
+modelscope_cache/
+review-web/data/
+
+# IDE / 系统
+.idea/
+.vscode/
+.git/
+.gitignore
+*.log
+
+# 文档（不影响运行）
+*.md
+!README.md
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# 脚本
+deploy.ps1
+deploy.sh

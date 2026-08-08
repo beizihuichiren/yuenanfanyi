@@ -1,0 +1,10 @@
+[project]
+name = "越南语自动化转译"
+version = "0.1.0"
+description = "自动化越南语翻译项目"
+authors = ["你的名字 <you@example.com>"]
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+test = ["pytest"]

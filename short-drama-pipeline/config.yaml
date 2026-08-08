@@ -1,0 +1,42 @@
+workspace: /data/short-drama
+
+download_dir: ${workspace}/downloads
+output_dir: ${workspace}/output
+
+api:
+  provider: openai
+  base_url: https://api.openai.com/v1
+  api_key: ${OPENAI_API_KEY}
+  model: gpt-4o
+  temperature: 0.3
+  max_tokens: 4096
+
+whisper:
+  model: large-v3
+  device: cuda
+  language: zh
+  beam_size: 5
+  vad_filter: true
+
+# 下载流程已取消：视频改为通过 Web 网页手动上传
+upload_dir: ${workspace}/uploads
+
+subtitle_remover:
+  image: eritpchy/video-subtitle-remover:1.1.1-cuda12.8
+  algorithm: sttn
+  gpu_device: 0
+
+subtitle_style:
+  font_name: Arial
+  font_size: 20
+  primary_color: "&H00FFFFFF"
+  outline_color: "&H00000000"
+  outline: 2
+  alignment: 2
+
+quality:
+  black_detect_duration: 1.0
+  black_detect_threshold: 0.10
+  freeze_detect_duration: 2.0
+  glitch_scene_threshold: 0.8
+  edge_sample_frames: 10

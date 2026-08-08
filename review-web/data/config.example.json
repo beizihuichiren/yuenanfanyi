@@ -1,0 +1,9 @@
+{
+  "asr_backend": "funasr",
+  "whisper_model_size": "small",
+  "openai_api_key": "sk-your-deepseek-api-key",
+  "openai_api_base": "https://api.deepseek.com/v1",
+  "openai_model": "deepseek-chat",
+  "proxy_port": "7892",
+  "modelscope_cache": "/app/modelscope_cache"
+}

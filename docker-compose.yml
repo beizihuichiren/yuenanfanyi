@@ -1,0 +1,82 @@
+# 短剧越南语转译流水线 - 一键部署编排
+#
+# 使用方式：
+#   方式 A（从 ghcr.io 拉取镜像，推荐）：
+#     1. 复制 .env.example 为 .env，填入 API Key 等配置
+#     2. docker compose pull && docker compose up -d
+#     3. 浏览器访问 http://<服务器IP>:5000
+#
+#   方式 B（本地构建镜像）：
+#     1. 复制 .env.example 为 .env，填入 API Key 等配置
+#     2. docker compose up -d --build
+#     3. 浏览器访问 http://<服务器IP>:5000
+#
+# 说明：
+#   - 主服务（web）跑 Flask 应用，负责流水线编排
+#   - 消字幕阶段通过 Docker-in-Docker 方式调用宿主机 docker
+#     （挂载 /var/run/docker.sock 让容器内能启动消字幕镜像）
+#   - 消字幕镜像 eritpchy/video-subtitle-remover 首次运行会自动拉取
+
+# 显式指定项目名（避免中文目录名导致 compose 报错 "project name must not be empty"）
+name: vietnamese-pipeline
+
+services:
+  web:
+    # 默认从 ghcr.io 拉取；如需本地构建，注释掉 image 行，取消注释 build 块
+    image: ghcr.io/beizihuichiren/yuenanfanyi:v0.1.0
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    container_name: vietnamese-pipeline
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-5000}:5000"
+    # GPU 支持（无 GPU 时注释掉整个 deploy 块，消字幕自动走 CPU 降级）
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      # ---- ASR 配置 ----
+      ASR_BACKEND: ${ASR_BACKEND:-funasr}
+      WHISPER_MODEL_SIZE: ${WHISPER_MODEL_SIZE:-large-v3}
+      MODELSCOPE_CACHE: /app/modelscope_cache
+      # ---- 翻译 API（DeepSeek）----
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_API_BASE: ${OPENAI_API_BASE:-https://api.deepseek.com/v1}
+      OPENAI_MODEL: ${OPENAI_MODEL:-deepseek-chat}
+      # ---- 代理（可选，DeepSeek 国内可直连）----
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: api.deepseek.com,localhost,127.0.0.1
+      # ---- FFmpeg（容器内已装，直接用 PATH）----
+      FFMPEG_BIN: /usr/bin/ffmpeg
+      FFPROBE_BIN: /usr/bin/ffprobe
+      # ---- 文件路径 ----
+      UPLOAD_DIR: /app/output/uploads
+      OUTPUT_DIR: /app/output
+    volumes:
+      # 持久化输出（任务产物、上传文件）
+      - ./output:/app/output
+      # 模型缓存（FunASR/Whisper 模型，避免每次重启重新下载）
+      - ./modelscope_cache:/app/modelscope_cache
+      # Docker-in-Docker：让容器内能调用宿主机 docker 启动消字幕镜像
+      - /var/run/docker.sock:/var/run/docker.sock
+      # 消字幕镜像需要访问视频文件，因此挂载相同的视频目录
+      - ./output:/data_shared
+    # 消字幕容器需要访问视频文件，因此特权模式（仅 D-in-D 需要）
+    privileged: true
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
