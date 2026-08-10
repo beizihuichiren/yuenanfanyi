@@ -23,10 +23,10 @@ name: vietnamese-pipeline
 services:
   web:
     # 默认从 ghcr.io 拉取；如需本地构建，注释掉 image 行，取消注释 build 块
-    # image: ghcr.io/beizihuichiren/yuenanfanyi:v0.1.0
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ghcr.io/beizihuichiren/yuenanfanyi:v0.2.0
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
     container_name: vietnamese-pipeline
     restart: unless-stopped
     ports:
