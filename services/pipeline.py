@@ -86,6 +86,45 @@ _subtitle_remove_semaphore = threading.Semaphore(
     int(__import__("os").environ.get("SUBTITLE_REMOVE_MAX_CONCURRENCY", "2"))
 )
 
+# 是否允许消字幕提前启动（与转写并行）
+# - 20GB+ 显存 (RTX 3080/4090): true，省 5+ 分钟/集
+# - 6-8GB 显存 (RTX 4050/3060): false，否则 FunASR OOM
+_SUBTITLE_EARLY_START = __import__("os").environ.get("SUBTITLE_EARLY_START", "true").lower() == "true"
+
+
+def set_runtime_concurrency(max_workers: int | None = None,
+                            subtitle_semaphore: int | None = None,
+                            subtitle_early_start: bool | None = None) -> dict:
+    """
+    运行时修改并发参数（用于 Web 一键切测试机/生产机）。
+    - max_workers: 新建线程池替换旧的；旧线程池排队任务会继续跑完但不再接新任务
+    - subtitle_semaphore: 替换全局信号量，控制消字幕并发
+    - subtitle_early_start: 是否允许消字幕与转写并行
+    返回当前生效配置。
+    """
+    global _MAX_WORKERS, _pipeline_executor, _subtitle_remove_semaphore, _SUBTITLE_EARLY_START
+    if isinstance(max_workers, int) and max_workers >= 1:
+        _MAX_WORKERS = max_workers
+        old = _pipeline_executor
+        _pipeline_executor = ThreadPoolExecutor(max_workers=_MAX_WORKERS, thread_name_prefix="pipeline")
+        try:
+            old.shutdown(wait=False)
+        except Exception:
+            pass
+    if isinstance(subtitle_semaphore, int) and subtitle_semaphore >= 1:
+        _subtitle_remove_semaphore = threading.Semaphore(subtitle_semaphore)
+    if isinstance(subtitle_early_start, bool):
+        _SUBTITLE_EARLY_START = subtitle_early_start
+    return get_runtime_concurrency()
+
+
+def get_runtime_concurrency() -> dict:
+    return {
+        "pipeline_max_workers": _MAX_WORKERS,
+        "subtitle_remove_max_concurrency": _subtitle_remove_semaphore._value,  # noqa: SLF001
+        "subtitle_early_start": _SUBTITLE_EARLY_START,
+    }
+
 
 def _refresh_queue_positions() -> None:
     """扫描所有 queued 任务，按创建时间编号排队位置（1=下一个执行）。"""
@@ -276,8 +315,13 @@ def run_pipeline(video_path: Path,
         # 消字幕只依赖原始视频，不依赖字幕。提前启动后与 Whisper 转写、翻译、
         # AI 校对并行跑，消字幕的 10 分钟被转写+翻译的 5 分钟"吸收"，单集省 5+ 分钟。
         # 消字幕并发由 _subtitle_remove_semaphore 控制，不会爆显存。
+        #
+        # ⚠️ 注意：消字幕和 FunASR 都用 GPU，提前启动会争抢显存。
+        #   - 20GB+ 显存（如 RTX 3080）：可设 SUBTITLE_EARLY_START=true，省 5+ 分钟/集
+        #   - 6-8GB 显存（如 RTX 4050/3060）：必须设 false，否则 FunASR OOM 转写失败
         subtitle_future = None
-        if not skip_remove:
+        # 使用全局变量，支持 Web 运行时一键切测试机/生产机（无需重启服务）
+        if not skip_remove and _SUBTITLE_EARLY_START:
             from concurrent.futures import ThreadPoolExecutor
             _subtitle_early_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="subtitle-early")
             subtitle_future = _subtitle_early_executor.submit(

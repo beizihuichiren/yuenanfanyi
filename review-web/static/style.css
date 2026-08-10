@@ -139,6 +139,49 @@ button {
   box-shadow: 0 0 0 2px rgba(37, 99, 235, .2);
 }
 
+.preset-section {
+  margin: 16px 0 4px;
+  padding: 14px 16px;
+  border-radius: 10px;
+  background: rgba(59, 130, 246, .06);
+  border: 1px solid rgba(59, 130, 246, .25);
+}
+.preset-section h3 {
+  margin: 0 0 10px;
+  font-size: 14px;
+  color: #cbd5e1;
+  font-weight: 600;
+}
+.preset-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.preset-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: #cbd5e1;
+  flex-wrap: wrap;
+}
+.preset-info b {
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(59, 130, 246, .18);
+  color: #93c5fd;
+}
+.preset-info b.isTest {
+  background: rgba(251, 191, 36, .18);
+  color: #fcd34d;
+}
+.preset-values {
+  color: #64748b;
+  font-size: 12px;
+  margin-left: 4px;
+}
+
 .config-actions {
   display: flex;
   align-items: center;

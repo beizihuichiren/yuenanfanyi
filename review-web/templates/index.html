@@ -55,6 +55,17 @@
               <input type="text" id="cfgProxyPort" placeholder="7892" />
             </div>
           </div>
+          <div class="preset-section">
+            <h3>🖥️ 性能预设</h3>
+            <div class="preset-row">
+              <button id="applyProdBtn" class="btn-secondary">切到生产机 (RTX 3080/20GB+)</button>
+              <button id="applyTestBtn" class="btn-secondary">切到测试机 (RTX 4050/6GB)</button>
+            </div>
+            <div class="preset-info">
+              <span>当前预设：</span><b id="currentPreset">加载中...</b>
+              <span class="preset-values" id="currentPresetValues"></span>
+            </div>
+          </div>
           <div class="config-actions">
             <button id="saveConfigBtn" class="btn-primary">保存配置</button>
             <button id="testConfigBtn" class="btn-secondary">测试 API 连通</button>
@@ -257,6 +268,48 @@
         if (body.hidden) { body.hidden = false; btn.textContent = '收起'; }
         else { body.hidden = true; btn.textContent = '展开'; }
       });
+
+      // ---------- 性能预设一键切换 ----------
+      async function loadPresetStatus() {
+        try {
+          const res = await fetch('/api/config/presets');
+          const data = await res.json();
+          const label = (data.presets && data.current_preset && data.presets[data.current_preset])
+            ? data.presets[data.current_preset].label
+            : (data.current_preset ? data.current_preset : '自定义');
+          const el = document.getElementById('currentPreset');
+          el.textContent = label;
+          el.classList.toggle('isTest', data.current_preset === 'test');
+          const vals = data.runtime || {};
+          const text = [];
+          if (vals.pipeline_max_workers != null) text.push(`流水线并发=${vals.pipeline_max_workers}`);
+          if (vals.subtitle_remove_max_concurrency != null) text.push(`消字幕并发=${vals.subtitle_remove_max_concurrency}`);
+          if (vals.subtitle_early_start != null) text.push(`消字幕提前=${vals.subtitle_early_start ? '开' : '关'}`);
+          document.getElementById('currentPresetValues').textContent = text.length ? `（ ${text.join(' · ')} ）` : '';
+        } catch (e) { console.error(e); }
+      }
+      async function applyPreset(name, btn) {
+        btn.disabled = true;
+        const oldText = btn.textContent;
+        btn.textContent = '切换中...';
+        try {
+          const res = await fetch(`/api/config/presets/${name}`, {method: 'POST'});
+          const data = await res.json();
+          if (res.ok) {
+            toast(`已切换到：${data.label}`);
+            loadConfig();
+            loadPresetStatus();
+          } else {
+            toast(data.error || '切换失败', true);
+          }
+        } catch (e) { toast('切换异常: ' + e.message, true); }
+        btn.disabled = false;
+        btn.textContent = oldText;
+      }
+      document.getElementById('applyProdBtn').addEventListener('click',
+        (e) => applyPreset('production', e.currentTarget));
+      document.getElementById('applyTestBtn').addEventListener('click',
+        (e) => applyPreset('test', e.currentTarget));
 
       // ---------- 上传 ----------
       const uploadArea = document.getElementById('uploadArea');
@@ -467,6 +520,7 @@
 
       // ---------- 初始化 ----------
       loadConfig();
+      loadPresetStatus();
       fetchTasks();
     </script>
   </body>

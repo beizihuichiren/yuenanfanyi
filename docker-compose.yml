@@ -23,10 +23,10 @@ name: vietnamese-pipeline
 services:
   web:
     # 默认从 ghcr.io 拉取；如需本地构建，注释掉 image 行，取消注释 build 块
-    image: ghcr.io/beizihuichiren/yuenanfanyi:v0.2.0
-    # build:
-    #   context: .
-    #   dockerfile: Dockerfile
+    # image: ghcr.io/beizihuichiren/yuenanfanyi:v0.2.0
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: vietnamese-pipeline
     restart: unless-stopped
     ports:
@@ -64,6 +64,8 @@ services:
       # ---- 并发配置（RTX 3080 20GB 推荐 2/2，可按显存调整）----
       PIPELINE_MAX_WORKERS: ${PIPELINE_MAX_WORKERS:-2}
       SUBTITLE_REMOVE_MAX_CONCURRENCY: ${SUBTITLE_REMOVE_MAX_CONCURRENCY:-2}
+      # 消字幕提前启动（与转写并行）：20GB+ 显存 true 省 5 分钟/集，6-8GB 显存 false
+      SUBTITLE_EARLY_START: ${SUBTITLE_EARLY_START:-true}
     volumes:
       # 持久化输出（任务产物、上传文件）
       - ./output:/app/output

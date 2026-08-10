@@ -50,6 +50,32 @@ DEFAULT_CONFIG = {
     "openai_model": "deepseek-chat",
     "proxy_port": "7892",
     "modelscope_cache": str(PROJECT_ROOT / "modelscope_cache"),
+    # ---- 并发/性能配置 ----
+    # 生产机（RTX 3080 20GB 及以上）默认值
+    "pipeline_max_workers": 2,
+    "subtitle_remove_max_concurrency": 2,
+    "subtitle_early_start": True,
+}
+
+
+# 预设配置（Web 一键切换）
+PRESETS = {
+    "production": {
+        "label": "生产机 (RTX 3080/20GB+)",
+        "values": {
+            "pipeline_max_workers": 2,
+            "subtitle_remove_max_concurrency": 2,
+            "subtitle_early_start": True,
+        },
+    },
+    "test": {
+        "label": "测试机 (RTX 4050/6GB)",
+        "values": {
+            "pipeline_max_workers": 1,
+            "subtitle_remove_max_concurrency": 1,
+            "subtitle_early_start": False,
+        },
+    },
 }
 
 
@@ -67,7 +93,7 @@ def load_config() -> Dict[str, Any]:
 
 
 def save_config(cfg: Dict[str, Any]) -> None:
-    """保存配置到文件，并同步到环境变量"""
+    """保存配置到文件，并同步到环境变量 + 运行时"""
     CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
     # 同步到环境变量，供子进程使用
     os.environ["ASR_BACKEND"] = cfg.get("asr_backend", "funasr")
@@ -82,6 +108,23 @@ def save_config(cfg: Dict[str, Any]) -> None:
         os.environ["HTTPS_PROXY"] = f"http://127.0.0.1:{proxy}"
         os.environ["NO_PROXY"] = "api.deepseek.com"
         os.environ["no_proxy"] = "api.deepseek.com"
+    # ---- 并发/性能：同步到环境变量 + 运行时全局 ----
+    try:
+        mw = int(cfg.get("pipeline_max_workers", 2))
+        ss = int(cfg.get("subtitle_remove_max_concurrency", 2))
+    except (TypeError, ValueError):
+        mw, ss = 2, 2
+    es = bool(cfg.get("subtitle_early_start", True))
+    os.environ["PIPELINE_MAX_WORKERS"] = str(mw)
+    os.environ["SUBTITLE_REMOVE_MAX_CONCURRENCY"] = str(ss)
+    os.environ["SUBTITLE_EARLY_START"] = "true" if es else "false"
+    # 运行时修改已加载的 pipeline 模块
+    try:
+        pipeline_service.set_runtime_concurrency(
+            max_workers=mw, subtitle_semaphore=ss, subtitle_early_start=es
+        )
+    except AttributeError:
+        pass
 
 
 # 启动时加载配置
@@ -339,10 +382,15 @@ def health():
 
 @app.get("/api/config")
 def get_config():
-    """读取当前配置（API key 脱敏）"""
+    """读取当前配置（API key 脱敏）+ 运行时并发"""
     cfg = load_config()
     key = cfg.get("openai_api_key", "")
     cfg["openai_api_key_masked"] = (key[:8] + "***" + key[-4:]) if len(key) > 12 else ("***" if key else "")
+    # 真实生效的运行时并发（与文件配置可能不同，因为 preset API 直接改运行时）
+    try:
+        cfg["runtime_concurrency"] = pipeline_service.get_runtime_concurrency()
+    except AttributeError:
+        cfg["runtime_concurrency"] = {}
     return jsonify(cfg)
 
 
@@ -353,9 +401,24 @@ def update_config():
     cfg = load_config()
     # 只允许更新这些字段
     for k in ("asr_backend", "whisper_model_size", "openai_api_key",
-              "openai_api_base", "openai_model", "proxy_port", "modelscope_cache"):
+              "openai_api_base", "openai_model", "proxy_port", "modelscope_cache",
+              "pipeline_max_workers", "subtitle_remove_max_concurrency", "subtitle_early_start"):
         if k in payload:
-            cfg[k] = payload[k]
+            if k == "pipeline_max_workers" or k == "subtitle_remove_max_concurrency":
+                try:
+                    cfg[k] = max(1, int(payload[k]))
+                except (TypeError, ValueError):
+                    pass
+            elif k == "subtitle_early_start":
+                v = payload[k]
+                if isinstance(v, bool):
+                    cfg[k] = v
+                elif isinstance(v, str):
+                    cfg[k] = v.lower() in ("true", "1", "yes", "on")
+                else:
+                    cfg[k] = bool(v)
+            else:
+                cfg[k] = payload[k]
     save_config(cfg)
     return jsonify({"ok": True, "config": cfg})
 
@@ -384,6 +447,50 @@ def test_config():
         return jsonify({"ok": True, "reply": reply.strip()})
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.get("/api/config/presets")
+def list_presets():
+    """列出可用性能预设和当前生效配置"""
+    # 当前持久化配置
+    cfg = load_config()
+    # 当前运行时真实生效（与文件可能因 Web 切 preset 而不同）
+    try:
+        runtime = pipeline_service.get_runtime_concurrency()
+    except AttributeError:
+        runtime = {}
+    # 判定当前属于哪个 preset
+    current_preset = None
+    for name, p in PRESETS.items():
+        v = p["values"]
+        if (int(cfg.get("pipeline_max_workers", 0)) == int(v["pipeline_max_workers"]) and
+                int(cfg.get("subtitle_remove_max_concurrency", 0)) == int(v["subtitle_remove_max_concurrency"]) and
+                bool(cfg.get("subtitle_early_start")) == bool(v["subtitle_early_start"])):
+            current_preset = name
+            break
+    result = {
+        "current_preset": current_preset,
+        "runtime": runtime,
+        "presets": {name: {"label": p["label"], "values": p["values"]} for name, p in PRESETS.items()},
+    }
+    return jsonify(result)
+
+
+@app.post("/api/config/presets/<preset_name>")
+def apply_preset(preset_name: str):
+    """应用性能预设（测试机/生产机一键切换），立即写入配置文件并生效"""
+    if preset_name not in PRESETS:
+        return jsonify({"ok": False, "error": f"未知预设: {preset_name}，可用: {list(PRESETS)}"}), 400
+    p = PRESETS[preset_name]
+    cfg = load_config()
+    cfg.update(p["values"])
+    save_config(cfg)
+    # 同步到 ASR/翻译 API 字段白名单
+    try:
+        runtime = pipeline_service.get_runtime_concurrency()
+    except AttributeError:
+        runtime = {}
+    return jsonify({"ok": True, "label": p["label"], "values": p["values"], "runtime": runtime})
 
 
 # ---- 任务详情 ----
