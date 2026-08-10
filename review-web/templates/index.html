@@ -333,18 +333,23 @@
           const res = await fetch('/api/upload', { method: 'POST', body: formData });
           const data = await res.json();
           if (!res.ok) { toast(data.error || '上传失败', true); return; }
-          document.getElementById('videoRef').value = data.filename;
+          // 视频文件名输入框显示原始文件名（用户友好），安全名存隐藏字段供流水线查找
+          document.getElementById('videoRef').value = data.original_name;
+          document.getElementById('videoRef').dataset.safeName = data.filename;
           document.getElementById('episodeTag').value = data.original_name.replace(/\.[^.]+$/, '');
           document.getElementById('uploadInfo').innerHTML =
-            `✓ 已上传: <b>${data.original_name}</b> → ${data.filename} (${fmtSize(data.size)})`;
+            `✓ 已上传: <b>${data.original_name}</b> (${fmtSize(data.size)})`;
           toast('上传成功');
         } catch (e) { toast('上传异常: ' + e.message, true); }
       }
 
       // ---------- 启动流水线 ----------
       document.getElementById('startBtn').addEventListener('click', async () => {
+        const videoRefEl = document.getElementById('videoRef');
+        // 优先用安全名（存储时加了 uuid 前缀防止重名），用户手填时退回原值
+        const safeName = videoRefEl.dataset.safeName || videoRefEl.value.trim();
         const payload = {
-          video: document.getElementById('videoRef').value.trim(),
+          video: safeName,
           episode_tag: document.getElementById('episodeTag').value.trim(),
         };
         if (!payload.video) { toast('请填写视频文件名', true); return; }
