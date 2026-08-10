@@ -264,14 +264,40 @@ def remove_subtitle(input_video: Path,
     raise RuntimeError(f"消字幕失败，已耗尽 {retries} 次重试与 CPU 降级方案。最后错误: {last_error}")
 
 
+def _to_host_path(container_path: Path) -> str:
+    """
+    将主容器内路径转换为宿主机路径（用于 Docker-in-Docker 卷挂载）。
+
+    主容器通过 docker.sock 启动消字幕容器时，-v 参数左侧必须是宿主机路径，
+    否则消字幕容器挂载到的是空目录。通过 HOST_OUTPUT_DIR 环境变量桥接。
+
+    非 D-in-D 场景（本地直跑）HOST_OUTPUT_DIR 为空，直接返回原路径。
+    """
+    host_output_dir = os.environ.get("HOST_OUTPUT_DIR", "").strip()
+    if not host_output_dir:
+        return str(container_path)
+
+    container_output_dir = os.environ.get("OUTPUT_DIR", "/app/output")
+    try:
+        rel = Path(container_path).relative_to(container_output_dir)
+        host_path = Path(host_output_dir) / rel
+        # 统一为正斜杠，兼容 Windows 宿主机 + Linux 容器
+        return str(host_path).replace("\\", "/")
+    except ValueError:
+        # 路径不在 OUTPUT_DIR 下，无法转换，返回原路径
+        return str(container_path)
+
+
 def _build_docker_command(input_video: Path,
                           gpu: int,
                           image: str,
                           cpu: bool) -> list[str]:
     """构造 Docker 调用命令（镜像通过 stdin 读取视频路径）"""
+    # D-in-D 场景：将容器内路径转换为宿主机路径，否则消字幕容器挂载到空目录
+    host_parent = _to_host_path(input_video.parent)
     cmd: list[str] = [
         "docker", "run", "--rm", "-i",
-        "-v", f"{input_video.parent}:/data",
+        "-v", f"{host_parent}:/data",
     ]
     if not cpu:
         cmd.extend(["--gpus", f"device={gpu}"])

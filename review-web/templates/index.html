@@ -163,7 +163,7 @@
 
       function statusLabel(s) {
         const map = {
-          pending: '排队中', extracting: '提取音频', transcribing: '转写中',
+          queued: '排队中', pending: '准备中', extracting: '提取音频', transcribing: '转写中',
           cleaning: '清洗中', translating: '翻译中', reviewing: 'AI校对中',
           awaiting_review: '待审核', applying: '应用审核', removing: '消字幕中',
           merging: '烧录字幕', quality: '终检中', done: '✓ 已完成', error: '✗ 失败',
@@ -175,7 +175,7 @@
       function statusClass(s) {
         if (s === 'done') return 'done';
         if (s === 'error') return 'error';
-        if (s === 'awaiting_review') return 'warn';
+        if (s === 'awaiting_review' || s === 'queued') return 'warn';
         return 'running';
       }
 
@@ -352,12 +352,16 @@
           const errLine = t.status === 'error' && t.error
             ? `<div class="err-msg">错误: ${t.error}</div>` : '';
 
+          // 排队中：状态标签显示排队位置
+          const queueTag = t.status === 'queued' && t.queue_position > 0
+            ? `（第${t.queue_position}位）` : '';
+
           return `
             <article class="task-card ${sClass}">
               <div class="task-header" onclick="toggleDetail('${t.task_id}')">
                 <div class="task-title">
                   <span class="task-name">${t.episode_tag}</span>
-                  <span class="status-pill ${sClass}">${statusLabel(t.status)}</span>
+                  <span class="status-pill ${sClass}">${statusLabel(t.status)}${queueTag}</span>
                 </div>
                 <div class="task-meta">任务 ${t.task_id} · ${fmtTime(t.started_at)}</div>
               </div>

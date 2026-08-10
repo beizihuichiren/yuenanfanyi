@@ -78,19 +78,38 @@ def burn_subtitle(video_path: Path,
         srt_arg = "subtitle_burn_tmp.srt"
         vf = f"subtitles={srt_arg}:force_style='{force_style}'"
 
-        cmd = [
+        # 优先用 GPU 编码（h264_nvenc），失败回退到 CPU（libx264）
+        # RTX 3080 GPU 编码比 CPU 快 5-8 倍，烧录从 2-3 分钟降到 20-30 秒
+        cmd_gpu = [
+            ffmpeg, "-y", "-i", str(video_path),
+            "-vf", vf,
+            "-c:a", "copy",
+            "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "20",
+            str(output_path),
+        ]
+        cmd_cpu = [
             ffmpeg, "-y", "-i", str(video_path),
             "-vf", vf,
             "-c:a", "copy",
             "-c:v", "libx264", "-crf", "18", "-preset", "medium",
             str(output_path),
         ]
-        logger.info("烧录字幕: %s", " ".join(cmd))
+        # 先试 GPU，失败回退 CPU
+        used_gpu = False
         try:
-            subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=7200)
-        except subprocess.CalledProcessError as exc:
-            logger.error("ffmpeg stderr: %s", exc.stderr)
-            raise RuntimeError(f"字幕烧录失败: {exc.stderr[:500] if exc.stderr else str(exc)}") from exc
+            logger.info("烧录字幕（GPU h264_nvenc）: %s", " ".join(cmd_gpu))
+            subprocess.run(cmd_gpu, check=True, capture_output=True, text=True, timeout=1800)
+            used_gpu = True
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            stderr = getattr(exc, 'stderr', '') or ''
+            if 'h264_nvenc' in stderr or 'No capable devices found' in stderr or isinstance(exc, subprocess.TimeoutExpired):
+                logger.warning("GPU 编码不可用，回退到 CPU (libx264): %s", stderr[:200])
+                logger.info("烧录字幕（CPU libx264）: %s", " ".join(cmd_cpu))
+                subprocess.run(cmd_cpu, check=True, capture_output=True, text=True, timeout=7200)
+            else:
+                logger.error("ffmpeg stderr: %s", stderr)
+                raise RuntimeError(f"字幕烧录失败: {stderr[:500] if stderr else str(exc)}") from exc
+        logger.info("字幕烧录完成（%s）: %s", "GPU" if used_gpu else "CPU", output_path)
     finally:
         if tmp_srt and tmp_srt.exists():
             tmp_srt.unlink()

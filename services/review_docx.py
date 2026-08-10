@@ -267,10 +267,16 @@ def ai_review_batch(cn_entries: list[SrtEntry],
     reviewed: list[SrtEntry] = []
     total_batches = (len(all_indices) + batch_size - 1) // batch_size
 
+    # 构造所有批次
+    batches: list[tuple[int, list[int]]] = []
     for batch_idx in range(total_batches):
         start_i = batch_idx * batch_size
         end_i = min(start_i + batch_size, len(all_indices))
-        batch_indices = all_indices[start_i:end_i]
+        batches.append((batch_idx, all_indices[start_i:end_i]))
+
+    def _review_one_batch(batch_info: tuple[int, list[int]]) -> list[SrtEntry]:
+        """处理单个校对批次，失败时回退初译。"""
+        batch_idx, batch_indices = batch_info
 
         # 构造批次输入：序号 | 中文 | 越南语初译
         batch_lines = []
@@ -319,13 +325,19 @@ def ai_review_batch(cn_entries: list[SrtEntry],
             resp.raise_for_status()
             content = resp.json()["choices"][0]["message"]["content"]
             batch_reviewed = _parse_reviewed_batch(content, batch_indices, vi_map)
-            reviewed.extend(batch_reviewed)
             logger.info("AI 校对批次 %d/%d 完成 (%d 条)",
                         batch_idx + 1, total_batches, len(batch_reviewed))
+            return batch_reviewed
         except Exception as exc:
             logger.warning("AI 校对批次 %d/%d 失败，回退初译: %s",
                            batch_idx + 1, total_batches, exc)
-            reviewed.extend(vi_map[idx] for idx in batch_indices)
+            return [vi_map[idx] for idx in batch_indices]
+
+    # 并发跑批次（3-4 并发，避免 API 限流）
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="ai-review") as pool:
+        for batch_result in pool.map(_review_one_batch, batches):
+            reviewed.extend(batch_result)
 
     # 按序号排序输出
     reviewed.sort(key=lambda e: e.index)

@@ -88,49 +88,6 @@ def save_config(cfg: Dict[str, Any]) -> None:
 save_config(load_config())
 
 
-def _register_demo_task():
-    """启动时把 output/最终成片/A_FunASR 的产出注册为已完成任务，便于在线预览"""
-    demo_dir = OUTPUT_DIR / "最终成片" / "A_FunASR"
-    final_video = demo_dir / "第1集_越南语转译成片.mp4"
-    if not final_video.exists():
-        return
-    import time as _time
-    from services.pipeline import create_task
-    cn_srt = demo_dir / "第1集_中文字幕.srt"
-    vi_srt_final = demo_dir / "第1集_越南语终版.srt"
-    vi_srt_v1 = demo_dir / "第1集_越南语初译.srt"
-    review_docx = demo_dir / "第1集_中越双语审核.docx"
-    audio = demo_dir / "第1集_audio.wav"
-    clean_video = OUTPUT_DIR / "消字幕测试" / "消字幕结果.mp4"
-    raw_txt = demo_dir / "第1集_转写原始.txt"
-    corrected_txt = demo_dir / "第1集_转写纠错后.txt"
-    status = create_task(
-        video_path=Path(r"C:\Users\MgAl\越南语自动化转译\testsuorse\第1集 (1).mp4"),
-        episode_tag="FunASR_第1集(演示)",
-        output_dir=demo_dir,
-    )
-    status.status = "done"
-    status.stage = "done"
-    status.progress = 100
-    status.message = "FunASR + AI纠错 + 翻译 + AI校对 + 烧录 全流程完成"
-    status.started_at = _time.time() - 600
-    status.finished_at = _time.time() - 500
-    artifacts = {"video": str(Path(r"C:\Users\MgAl\越南语自动化转译\testsuorse\第1集 (1).mp4"))}
-    if audio.exists(): artifacts["audio"] = str(audio)
-    if cn_srt.exists(): artifacts["cn_srt"] = str(cn_srt)
-    if vi_srt_v1.exists(): artifacts["vi_srt_v1"] = str(vi_srt_v1)
-    if vi_srt_final.exists(): artifacts["vi_srt_final"] = str(vi_srt_final)
-    if review_docx.exists(): artifacts["review_docx"] = str(review_docx)
-    if raw_txt.exists(): artifacts["transcript_raw"] = raw_txt.read_text(encoding="utf-8")
-    if corrected_txt.exists(): artifacts["transcript_corrected"] = corrected_txt.read_text(encoding="utf-8")
-    artifacts["final_video"] = str(final_video)
-    if clean_video.exists(): artifacts["clean_video"] = str(clean_video)
-    status.artifacts = artifacts
-    print(f"[demo] 已注册演示任务: {status.task_id}")
-
-
-_register_demo_task()
-
 
 def load_subtitles() -> List[Dict[str, Any]]:
     if not DATA_FILE.exists():

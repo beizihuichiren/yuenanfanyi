@@ -15,6 +15,7 @@ import re
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Callable, Optional
@@ -60,6 +61,7 @@ class TaskStatus:
     output_dir: str = ""             # 输出目录（resume 时需要）
     skip_remove: bool = False        # resume 时继承
     skip_quality: bool = False       # resume 时继承
+    queue_position: int = 0          # 排队位置：0=执行中/未排队，>0=前面还有N个
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -68,6 +70,30 @@ class TaskStatus:
 # 全局任务注册表（线程安全）
 _tasks: dict[str, TaskStatus] = {}
 _tasks_lock = threading.Lock()
+
+# 流水线 worker 线程池：整体并发数
+# - RTX 3080 20GB + 64GB 内存 + 6 核 CPU，2 条流水线资源互补最优
+# - ASR/翻译/烧录/质检阶段可以并行，CPU/GPU/网络各司其职
+# - 消字幕阶段由信号量单独限流（见下方），不会爆显存
+# 可通过环境变量 PIPELINE_MAX_WORKERS 覆盖
+_MAX_WORKERS = int(__import__("os").environ.get("PIPELINE_MAX_WORKERS", "2"))
+_pipeline_executor = ThreadPoolExecutor(max_workers=_MAX_WORKERS, thread_name_prefix="pipeline")
+
+# 消字幕阶段全局信号量：RTX 3080 20GB 显存可同时跑 2 个消字幕实例
+# 单实例占 4-6GB 显存，2 个约 10-12GB，留 8GB 给系统/显示/其他 GPU 任务
+# 第 3 个会因 CUDA 算力争抢导致每个都慢 40%+，得不偿失
+_subtitle_remove_semaphore = threading.Semaphore(
+    int(__import__("os").environ.get("SUBTITLE_REMOVE_MAX_CONCURRENCY", "2"))
+)
+
+
+def _refresh_queue_positions() -> None:
+    """扫描所有 queued 任务，按创建时间编号排队位置（1=下一个执行）。"""
+    with _tasks_lock:
+        queued = [t for t in _tasks.values() if t.status == "queued"]
+        queued.sort(key=lambda t: t.started_at)
+        for idx, t in enumerate(queued, 1):
+            t.queue_position = idx
 
 
 def create_task(video_path: Path, episode_tag: str, output_dir: Path = None,
@@ -128,16 +154,29 @@ def _whisper_to_srt(transcript: str, audio_path: Path) -> list[SrtEntry]:
 
 
 def translate_srt_batch(entries: list[SrtEntry], translation_service: TranslationService,
-                        glossary: Optional[dict] = None) -> list[SrtEntry]:
+                        glossary: Optional[dict] = None,
+                        max_workers: int = 10) -> list[SrtEntry]:
     """
-    逐条翻译 SRT（保留时间轴与序号）。批量翻译请由调用方组装 prompt。
-    若 TranslationService 不可用，返回 [自动转译] 占位。
+    并发翻译 SRT（保留时间轴与序号）。
+    默认 10 并发，DeepSeek API 限流时自动降级重试。
+    若 TranslationService 不可用，返回原文占位。
     """
     glossary = glossary or {}
-    translated: list[SrtEntry] = []
-    for e in entries:
+    if not entries:
+        return []
+
+    # 单条翻译函数（保留 index 用于排序）
+    def _translate_one(e: SrtEntry) -> SrtEntry:
         vi_text = translation_service.translate(e.text)
-        translated.append(SrtEntry(index=e.index, start=e.start, end=e.end, text=vi_text))
+        return SrtEntry(index=e.index, start=e.start, end=e.end, text=vi_text)
+
+    # 并发翻译（按 index 提交，按 index 排序返回，保证顺序）
+    from concurrent.futures import ThreadPoolExecutor
+    translated: list[SrtEntry] = []
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="translate") as pool:
+        translated = list(pool.map(_translate_one, entries))
+
+    translated.sort(key=lambda e: e.index)
     return translated
 
 
@@ -232,6 +271,19 @@ def run_pipeline(video_path: Path,
         audio_path = output_dir / f"{episode_tag}_audio.wav"
         ffmpeg_service.extract_audio(str(video_path), str(audio_path))
         artifacts["audio"] = str(audio_path)
+
+        # ---- 消字幕提前启动（与转写/翻译/校对并行，榨干 GPU）----
+        # 消字幕只依赖原始视频，不依赖字幕。提前启动后与 Whisper 转写、翻译、
+        # AI 校对并行跑，消字幕的 10 分钟被转写+翻译的 5 分钟"吸收"，单集省 5+ 分钟。
+        # 消字幕并发由 _subtitle_remove_semaphore 控制，不会爆显存。
+        subtitle_future = None
+        if not skip_remove:
+            from concurrent.futures import ThreadPoolExecutor
+            _subtitle_early_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="subtitle-early")
+            subtitle_future = _subtitle_early_executor.submit(
+                _do_subtitle_removal, video_path, episode_tag, sop_dirs, artifacts
+            )
+            logger.info("消字幕已提前启动（与转写/翻译并行）")
 
         # ---- 阶段 2: Whisper 转写 ----
         _upd("transcribing", 15, "Whisper 转写中文字幕")
@@ -346,6 +398,7 @@ def run_pipeline(video_path: Path,
             skip_quality=skip_quality,
             artifacts=artifacts,
             sop_dirs=sop_dirs,
+            subtitle_future=subtitle_future,
         )
 
     except Exception as exc:
@@ -384,29 +437,17 @@ def _write_review_note(path: Path, cn: list[SrtEntry], vi_v1: list[SrtEntry],
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def _run_pipeline_after_review(video_path: Path,
-                               output_dir: Path,
-                               episode_tag: str,
-                               status: Optional[TaskStatus],
-                               vi_entries: list[SrtEntry],
-                               vi_srt_final: Path,
-                               skip_remove: bool,
-                               skip_quality: bool,
-                               artifacts: dict,
-                               sop_dirs: dict) -> dict:
-    """流水线后段：消字幕 → 烧录 → 质检，按 SOP 命名产出。"""
-    video_path = Path(video_path)
-    settings = get_settings()
+def _do_subtitle_removal(video_path: Path, episode_tag: str,
+                         sop_dirs: dict, artifacts: dict) -> tuple[Path, dict]:
+    """
+    执行消字幕全流程：检测区域 → 消字幕 → 时长校验 → 质量验证。
+    被提取为独立函数以支持提前启动（与转写/翻译/校对并行）。
 
-    def _upd(stage: str, progress: int, message: str = ""):
-        if status is not None:
-            _update(status, stage, progress, message)
-
-    # ---- 阶段 6: 消字幕 ----
-    if not skip_remove:
-        _upd("removing", 70, "检测字幕区域")
+    Returns:
+        (clean_video_path, verify_result)
+    """
+    with _subtitle_remove_semaphore:
         region = detect_subtitle_region(video_path)
-        _upd("removing", 75, "调用 Docker 消字幕")
         clean_video = sop_dirs["07_消字幕视频"] / f"{episode_tag}_消除字幕版.mp4"
         remove_subtitle(
             input_video=video_path,
@@ -418,9 +459,60 @@ def _run_pipeline_after_review(video_path: Path,
         )
         assert_duration_match(video_path, clean_video)
         verify = verify_removed(video_path, clean_video, region=region)
-        artifacts["remove_verify"] = verify
-        artifacts["clean_video"] = str(clean_video)
-        input_for_merge = clean_video
+        return clean_video, verify
+
+
+def _run_pipeline_after_review(video_path: Path,
+                               output_dir: Path,
+                               episode_tag: str,
+                               status: Optional[TaskStatus],
+                               vi_entries: list[SrtEntry],
+                               vi_srt_final: Path,
+                               skip_remove: bool,
+                               skip_quality: bool,
+                               artifacts: dict,
+                               sop_dirs: dict,
+                               subtitle_future: Optional[object] = None) -> dict:
+    """
+    流水线后段：消字幕 → 烧录 → 质检，按 SOP 命名产出。
+
+    Args:
+        subtitle_future: 若 run_pipeline 已提前启动消字幕（concurrent.futures.Future），
+                         此处等待其完成，避免重复执行；None 则正常同步执行（resume 场景）。
+    """
+    video_path = Path(video_path)
+    settings = get_settings()
+
+    def _upd(stage: str, progress: int, message: str = ""):
+        if status is not None:
+            _update(status, stage, progress, message)
+
+    # ---- 阶段 6: 消字幕 ----
+    if not skip_remove:
+        if subtitle_future is not None:
+            # 消字幕已在前段提前启动，等待结果
+            _upd("removing", 68, "等待消字幕完成（已提前启动）")
+            try:
+                clean_video, verify = subtitle_future.result()
+                artifacts["remove_verify"] = verify
+                artifacts["clean_video"] = str(clean_video)
+                input_for_merge = clean_video
+                _upd("removing", 78, "消字幕已完成")
+            except Exception as exc:
+                logger.error("提前启动的消字幕失败，回退到同步执行: %s", exc)
+                # 回退到同步执行
+                _upd("removing", 70, "消字幕（回退同步执行）")
+                clean_video, verify = _do_subtitle_removal(video_path, episode_tag, sop_dirs, artifacts)
+                artifacts["remove_verify"] = verify
+                artifacts["clean_video"] = str(clean_video)
+                input_for_merge = clean_video
+        else:
+            # resume 场景或未提前启动，正常同步执行
+            _upd("removing", 68, "等待消字幕资源")
+            clean_video, verify = _do_subtitle_removal(video_path, episode_tag, sop_dirs, artifacts)
+            artifacts["remove_verify"] = verify
+            artifacts["clean_video"] = str(clean_video)
+            input_for_merge = clean_video
     else:
         _upd("merging", 80, "跳过消字幕")
         input_for_merge = video_path
@@ -459,9 +551,17 @@ def run_pipeline_async(video_path: Path,
     不再在审核环节暂停（AI 校对替代人工审核）。
     """
     status = create_task(video_path, episode_tag, output_dir, skip_remove, skip_quality)
+    # 标记为排队中，单 worker 线程池会按提交顺序串行执行
+    status.status = "queued"
+    status.message = "排队中"
+    _refresh_queue_positions()
 
     def _worker():
         try:
+            # 真正开始执行，清掉排队位置
+            status.queue_position = 0
+            status.status = "pending"
+            _refresh_queue_positions()
             run_pipeline(
                 video_path=video_path,
                 output_dir=output_dir,
@@ -477,9 +577,9 @@ def run_pipeline_async(video_path: Path,
             status.status = "error"
             status.error = str(exc)
             status.finished_at = time.time()
+            _refresh_queue_positions()
 
-    thread = threading.Thread(target=_worker, daemon=True, name=f"pipeline-{status.task_id}")
-    thread.start()
+    _pipeline_executor.submit(_worker)
     return status
 
 
@@ -530,12 +630,17 @@ def resume_pipeline_async(task_id: str, review_docx_path: Path) -> TaskStatus:
     write_srt(vi_reviewed, vi_srt_final)
     artifacts["vi_srt_final"] = str(vi_srt_final)
 
-    # 状态切回 running
-    status.status = "applying"
+    # 状态切回排队（走单 worker 队列，避免与正在跑的流水线抢 GPU）
+    status.status = "queued"
     status.error = ""
+    status.message = "续跑排队中"
+    _refresh_queue_positions()
 
     def _worker():
         try:
+            status.queue_position = 0
+            status.status = "applying"
+            _refresh_queue_positions()
             _run_pipeline_after_review(
                 video_path=Path(status.video_path),
                 output_dir=output_dir,
@@ -553,7 +658,7 @@ def resume_pipeline_async(task_id: str, review_docx_path: Path) -> TaskStatus:
             status.status = "error"
             status.error = str(exc)
             status.finished_at = time.time()
+            _refresh_queue_positions()
 
-    thread = threading.Thread(target=_worker, daemon=True, name=f"pipeline-resume-{task_id}")
-    thread.start()
+    _pipeline_executor.submit(_worker)
     return status
