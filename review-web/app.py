@@ -43,8 +43,8 @@ ALLOWED_VIDEO_EXT = {".mp4", ".mkv", ".mov", ".flv", ".avi"}
 
 # 默认配置
 DEFAULT_CONFIG = {
-    "asr_backend": "funasr",
-    "whisper_model_size": "large-v3",
+    "asr_backend": "whisper",
+    "whisper_model_size": "small",
     "openai_api_key": "",
     "openai_api_base": "https://api.deepseek.com/v1",
     "openai_model": "deepseek-chat",

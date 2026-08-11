@@ -28,6 +28,68 @@ except Exception:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 
+# faster-whisper 模型加载单例缓存：key = (model_path_or_id, device, compute_type)
+_LOADED_WHISPER_MODELS: dict[tuple, object] = {}
+
+
+def _find_local_model_dir(size: str) -> Optional[str]:
+    """按优先级查找 faster-whisper 的本地模型目录（绕过 HuggingFace 下载）。
+
+    候选目录依次为：
+      1. WHISPER_LOCAL_MODEL_DIR 环境变量（用户显式指定）
+      2. ${OUTPUT_DIR}/model_cache/faster-whisper-${size}
+      3. ${MODELSCOPE_CACHE}/faster-whisper-${size}
+      4. /app/modelscope_cache/faster-whisper-${size}（兜底）
+
+    只有当目录中同时存在 config.json / model.bin / tokenizer.json / vocabulary.txt
+    这四个 faster-whisper 必要文件时才判定为有效目录。
+    """
+    required = ("config.json", "model.bin", "tokenizer.json", "vocabulary.txt")
+
+    candidates: list[str] = []
+    env_dir = os.getenv("WHISPER_LOCAL_MODEL_DIR", "").strip()
+    if env_dir:
+        candidates.append(env_dir)
+    output_dir = os.getenv("OUTPUT_DIR", "/app/output").strip()
+    if output_dir:
+        candidates.append(os.path.join(output_dir, "model_cache", f"faster-whisper-{size}"))
+    modelscope_cache = os.getenv("MODELSCOPE_CACHE", "").strip()
+    if modelscope_cache:
+        candidates.append(os.path.join(modelscope_cache, f"faster-whisper-{size}"))
+    candidates.append(f"/app/modelscope_cache/faster-whisper-{size}")
+
+    for path in candidates:
+        if not path:
+            continue
+        try:
+            if not os.path.isdir(path):
+                continue
+            missing = [name for name in required if not os.path.isfile(os.path.join(path, name))]
+            if missing:
+                logger.info("本地模型目录 %s 缺少文件 %s，跳过", path, missing)
+                continue
+            logger.info("找到本地 faster-whisper-%s 模型目录: %s", size, path)
+            return path
+        except OSError as exc:
+            logger.warning("检查本地模型目录 %s 失败: %s", path, exc)
+    return None
+
+
+def _get_whisper_model(model_path_or_id: str, device: str, compute_type: str):
+    """获取 WhisperModel 实例（进程内单例缓存，避免重复加载）。"""
+    key = (model_path_or_id, device, compute_type)
+    cached = _LOADED_WHISPER_MODELS.get(key)
+    if cached is not None:
+        logger.info("复用已加载的 Whisper 模型: %s (device=%s, compute=%s)",
+                    model_path_or_id, device, compute_type)
+        return cached
+    logger.info("首次加载 Whisper 模型: %s (device=%s, compute=%s)",
+                model_path_or_id, device, compute_type)
+    model = WhisperModel(model_path_or_id, device=device, compute_type=compute_type)
+    _LOADED_WHISPER_MODELS[key] = model
+    return model
+
+
 # 句子结束标点（中文+英文）
 _SENTENCE_END = set("。！？!?；;")
 # 标点符号（不对应时间戳，对齐时需跳过）
@@ -167,10 +229,16 @@ class WhisperService:
                 return text
             logger.warning("FunASR 失败，回退到 faster_whisper")
 
-        if self.backend in ("funasr", "whisper") and WhisperModel is not None:
-            text = self._transcribe_local_whisper(audio_path)
-            if text:
-                return text
+        if self.backend in ("funasr", "whisper"):
+            if WhisperModel is None:
+                logger.warning(
+                    "faster-whisper 未安装（ModuleNotFound），跳过本地转写。"
+                    "请执行: pip install faster-whisper"
+                )
+            else:
+                text = self._transcribe_local_whisper(audio_path)
+                if text:
+                    return text
 
         if self.backend in ("funasr", "whisper", "openai_api"):
             text = self._transcribe_api(audio_path, retries)
@@ -182,30 +250,64 @@ class WhisperService:
         return fallback_text
 
     def _transcribe_local_whisper(self, audio_path: str) -> str:
-        """本地 faster_whisper 转写"""
+        """本地 faster_whisper 转写
+
+        优先从本地缓存目录加载模型（绕开 HuggingFace 下载），避免在 hosts 屏蔽
+        huggingface.co 的环境下下载失败。只有本地目录不可用时才回退到
+        HuggingFace Hub 下载 Systran/faster-whisper-{size}。
+        """
         try:
-            logger.info("Loading faster_whisper model: %s", self.local_model_size)
-            model = WhisperModel(
-                self.local_model_size,
-                device="cpu",
-                compute_type="int8",
-            )
-            segments, _ = model.transcribe(
-                audio_path,
-                beam_size=5,
-                language="zh",
-                vad_filter=True,
-            )
-            text = "\n".join(
-                segment.text.strip()
-                for segment in segments
-                if segment.text and segment.text.strip()
-            )
+            size = self.local_model_size
+            local_dir = _find_local_model_dir(size)
+            if local_dir is not None:
+                model_path_or_id: str = local_dir
+            else:
+                # 回退：尝试 Systran 官方 HF Hub（若 DNS/hosts 屏蔽则失败）
+                logger.warning(
+                    "未找到本地 faster-whisper-%s 模型目录，尝试从 HuggingFace 下载 "
+                    "Systran/faster-whisper-%s（若 hosts 屏蔽了 huggingface.co 会失败）",
+                    size, size,
+                )
+                model_path_or_id = f"Systran/faster-whisper-{size}"
+
+            logger.info("Loading faster_whisper model: %s", model_path_or_id)
+            device = "cpu"
+            compute_type = "int8"
+            model = _get_whisper_model(model_path_or_id, device, compute_type)
+
+            def _run_transcribe(vad_filter: bool) -> list[str]:
+                segments, _info = model.transcribe(
+                    audio_path,
+                    beam_size=5,
+                    language="zh",
+                    vad_filter=vad_filter,
+                )
+                return [
+                    segment.text.strip()
+                    for segment in segments
+                    if segment.text and segment.text.strip()
+                ]
+
+            # 先走 VAD 模式（过滤静音、背景音，提升准确率和速度）
+            snippets = _run_transcribe(vad_filter=True)
+            if not snippets:
+                # VAD 模式下把整段音频都删了（静音/低音量），
+                # 兜底再跑一次关闭 VAD 的转写，避免走到 API 回退返回占位符。
+                logger.warning(
+                    "VAD 过滤后无有效转写片段，降级关闭 VAD 再试一次（音频可能过于安静）"
+                )
+                snippets = _run_transcribe(vad_filter=False)
+
+            text = "\n".join(snippets)
             if text.strip():
-                logger.info("Local Whisper transcription succeeded (model=%s)", self.local_model_size)
+                logger.info(
+                    "Local Whisper transcription succeeded (source=%s, segments=%d)",
+                    model_path_or_id, len(snippets),
+                )
                 return text.strip()
+            logger.warning("Local Whisper transcription returned empty text")
         except Exception as exc:
-            logger.warning("Local Whisper transcription failed: %s", exc)
+            logger.warning("Local Whisper transcription failed: %s", exc, exc_info=True)
         return ""
 
     def _transcribe_funasr(self, audio_path: str) -> str:

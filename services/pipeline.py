@@ -325,7 +325,7 @@ def run_pipeline(video_path: Path,
             from concurrent.futures import ThreadPoolExecutor
             _subtitle_early_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="subtitle-early")
             subtitle_future = _subtitle_early_executor.submit(
-                _do_subtitle_removal, video_path, episode_tag, sop_dirs, artifacts
+                _do_subtitle_removal, raw_archive, episode_tag, sop_dirs, artifacts
             )
             logger.info("消字幕已提前启动（与转写/翻译并行）")
 
@@ -432,7 +432,7 @@ def run_pipeline(video_path: Path,
 
         # ============ 后段（消字幕 → 烧录 → 质检）============
         return _run_pipeline_after_review(
-            video_path=video_path,
+            video_path=raw_archive,
             output_dir=output_dir,
             episode_tag=episode_tag,
             status=status,
@@ -559,7 +559,7 @@ def _run_pipeline_after_review(video_path: Path,
             input_for_merge = clean_video
     else:
         _upd("merging", 80, "跳过消字幕")
-        input_for_merge = video_path
+        input_for_merge = video_path  # video_path 即调用方传入的 raw_archive
 
     # ---- 阶段 7: 烧录越南语字幕 ----
     _upd("merging", 85, "烧录越南语字幕")

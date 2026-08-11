@@ -23,10 +23,10 @@ name: vietnamese-pipeline
 services:
   web:
     # 默认从 ghcr.io 拉取；如需本地构建，注释掉 image 行，取消注释 build 块
-    image: ghcr.io/beizihuichiren/yuenanfanyi:v0.4.0
-    # build:
-    #   context: .
-    #   dockerfile: Dockerfile
+    # image: ghcr.io/beizihuichiren/yuenanfanyi:v0.4.0
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: vietnamese-pipeline
     restart: unless-stopped
     ports:
@@ -41,9 +41,13 @@ services:
               capabilities: [gpu]
     environment:
       # ---- ASR 配置 ----
-      ASR_BACKEND: ${ASR_BACKEND:-funasr}
-      WHISPER_MODEL_SIZE: ${WHISPER_MODEL_SIZE:-large-v3}
+      # 默认走 faster-whisper 本地模型（小模型 small 够用，CPU 也能跑，且已在宿主机缓存）
+      ASR_BACKEND: ${ASR_BACKEND:-whisper}
+      WHISPER_MODEL_SIZE: ${WHISPER_MODEL_SIZE:-small}
       MODELSCOPE_CACHE: /app/modelscope_cache
+      # HuggingFace 镜像站（若代码触发 HF 下载，会走国内镜像避免 DNS/hosts 屏蔽）
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://hf-mirror.com}
+      HUGGINGFACE_HUB_CACHE: /app/output/model_cache/hf_hub
       # ---- 翻译 API（DeepSeek）----
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_API_BASE: ${OPENAI_API_BASE:-https://api.deepseek.com/v1}

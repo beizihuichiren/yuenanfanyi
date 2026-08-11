@@ -33,10 +33,23 @@ WORKDIR /app
 
 # ---- 先装 Python 依赖（利用 Docker 层缓存）----
 COPY requirements.txt .
-RUN pip install --upgrade pip && pip install -r requirements.txt
+# 注意：Docker build 时会继承宿主机的 HTTP_PROXY/HTTPS_PROXY，若指向 127.0.0.1:7892
+# 之类的本地代理，会导致 build 容器内 Connection refused。此处显式清空代理，
+# 并使用国内 PyPI 镜像直连下载，避免依赖代理。
+RUN env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
+        pip install --upgrade pip \
+            --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+            --trusted-host pypi.tuna.tsinghua.edu.cn \
+    && env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
+        pip install -r requirements.txt \
+            --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+            --trusted-host pypi.tuna.tsinghua.edu.cn
 
 # 额外装 Docker SDK（用于在容器内调用宿主机 Docker）
-RUN pip install docker
+RUN env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
+        pip install docker \
+            --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+            --trusted-host pypi.tuna.tsinghua.edu.cn
 
 # ---- 拷贝项目代码 ----
 COPY services/ ./services/
