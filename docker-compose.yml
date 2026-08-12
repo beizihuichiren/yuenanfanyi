@@ -1,4 +1,4 @@
-﻿# 短剧越南语转译流水线 - 一键部署编排
+# 短剧越南语转译流水线 - 一键部署编排
 #
 # 使用方式：
 #   方式 A（从 ghcr.io 拉取镜像，推荐）：
@@ -79,6 +79,15 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       # 消字幕镜像需要访问视频文件，因此挂载相同的视频目录
       - ./output:/data_shared
+      # -------------------------------------------------------------------
+      # 配置持久化（Web 页面填写 ↔ .env 双向同步，容器重建后不丢失）
+      #   review-web/data:  config.json（Web 设置）、subtitles.json（审核数据）
+      #   ./.env:           Web 保存配置时会写回宿主机 .env，compose restart 后仍生效
+      # 注意: .env 必须是文件不能是目录。首次部署前先执行 `Copy-Item .env.example .env`
+      #       或用 .\deploy.ps1（脚本会自动复制）。
+      # -------------------------------------------------------------------
+      - ./review-web/data:/app/review-web/data
+      - ./.env:/app/.env
     # 消字幕容器需要访问视频文件，因此特权模式（仅 D-in-D 需要）
     privileged: true
     healthcheck:

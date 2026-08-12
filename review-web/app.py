@@ -79,9 +79,163 @@ PRESETS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# .env ↔ config.json 双向同步映射表
+# 每条: (config_key, env_key, to_env_serializer, from_env_deserializer)
+#   - serializer:   把 Python 值转成 .env 中 KEY=VALUE 的 VALUE 字符串
+#   - deserializer: 把 .env VALUE 字符串转回 Python 值
+# ---------------------------------------------------------------------------
+def _s_str(v: Any) -> str: return "" if v is None else str(v)
+def _s_bool(v: Any) -> str: return "true" if bool(v) else "false"
+def _s_int(v: Any) -> str: return str(max(1, int(v or 1)))
+def _d_str(v: str) -> Any: return v
+def _d_bool(v: str) -> Any: return str(v).lower() in ("true", "1", "yes", "on")
+def _d_int(v: str) -> Any:
+    try: return max(1, int(v))
+    except (TypeError, ValueError): return 1
+
+ENV_CONFIG_MAP = [
+    # (config_key,              env_key,                    to_env,   from_env)
+    ("asr_backend",              "ASR_BACKEND",              _s_str,   _d_str),
+    ("whisper_model_size",       "WHISPER_MODEL_SIZE",       _s_str,   _d_str),
+    ("openai_api_key",           "OPENAI_API_KEY",           _s_str,   _d_str),
+    ("openai_api_base",          "OPENAI_API_BASE",          _s_str,   _d_str),
+    ("openai_model",             "OPENAI_MODEL",             _s_str,   _d_str),
+    ("modelscope_cache",         "MODELSCOPE_CACHE",         _s_str,   _d_str),
+    ("pipeline_max_workers",     "PIPELINE_MAX_WORKERS",     _s_int,   _d_int),
+    ("subtitle_remove_max_concurrency", "SUBTITLE_REMOVE_MAX_CONCURRENCY", _s_int, _d_int),
+    ("subtitle_early_start",     "SUBTITLE_EARLY_START",     _s_bool,  _d_bool),
+]
+# proxy_port 单独处理（要拼成 http://127.0.0.1:port 的格式写到 HTTP_PROXY/HTTPS_PROXY）
+
+
+def _find_env_file() -> Path:
+    """定位 .env 文件。Docker 部署下会把宿主机 ./.env 挂载到 /app/.env。"""
+    candidates = [
+        PROJECT_ROOT / ".env",        # /app/.env（容器内，与宿主机 bind mount）
+        PROJECT_ROOT / ".env.example", # 兜底：没有 .env 时用 example 做模板
+    ]
+    for p in candidates:
+        if p.exists() and p.is_file():
+            return p
+    # 都不存在，就写回项目根目录的 .env
+    return PROJECT_ROOT / ".env"
+
+
+def _parse_env_file(path: Path) -> List[Dict[str, Any]]:
+    """解析 .env 文件，逐行保留结构。
+    返回 list，每一项是 dict:
+      {"type": "blank" | "comment" | "kv", "raw": str,
+       "key": str|None, "value": str|None}
+    这样写回时能保留注释、空行、未知变量。
+    """
+    rows: List[Dict[str, Any]] = []
+    if not path.exists() or not path.is_file():
+        return rows
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except OSError:
+        return rows
+    for raw in text.splitlines():
+        s = raw.strip()
+        if not s:
+            rows.append({"type": "blank", "raw": raw})
+            continue
+        if s.startswith("#") or s.startswith(";"):
+            rows.append({"type": "comment", "raw": raw})
+            continue
+        if "=" not in s:
+            rows.append({"type": "comment", "raw": raw})
+            continue
+        # 拆分 KEY=VALUE，VALUE 允许包含等号（如 URL 带 ?a=1&b=2）
+        eq = raw.find("=")
+        key = raw[:eq].strip()
+        raw_value = raw[eq + 1 :].strip()
+        # 处理引号包裹：引号内原样保留（含空格/#），无引号则去掉尾部空格#内联注释
+        if len(raw_value) >= 2 and raw_value[0] == raw_value[-1] and raw_value[0] in ('"', "'"):
+            value = raw_value[1:-1]
+        else:
+            value = raw_value
+            m = re.search(r"\s+#", value)
+            if m:
+                value = value[:m.start()].rstrip()
+        rows.append({"type": "kv", "raw": raw, "key": key, "value": value})
+    return rows
+
+
+def _write_env_file(path: Path, updates: Dict[str, str]) -> None:
+    """按 KEY 更新 .env 文件，保留所有注释/空行/未知变量。
+    如果某 KEY 在原文件中不存在，会追加到文件末尾。
+    """
+    rows = _parse_env_file(path)
+    seen: set[str] = set()
+    new_rows: List[str] = []
+    for r in rows:
+        if r["type"] == "kv" and r["key"] in updates:
+            seen.add(r["key"])
+            v = updates[r["key"]]
+            # 含空格或特殊字符的值加引号
+            need_quote = any(ch in v for ch in " \t'\"#&|<>") or v == ""
+            if need_quote:
+                v_quoted = '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+            else:
+                v_quoted = v
+            new_rows.append(f"{r['key']}={v_quoted}")
+        else:
+            new_rows.append(r["raw"])
+    # 追加原文件没有的新 KEY
+    for k, v in updates.items():
+        if k in seen:
+            continue
+        need_quote = any(ch in v for ch in " \t'\"#&|<>") or v == ""
+        if need_quote:
+            v_quoted = '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        else:
+            v_quoted = v
+        new_rows.append(f"{k}={v_quoted}")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(new_rows) + "\n", encoding="utf-8")
+    except OSError as exc:
+        logger.warning("写入 .env 到 %s 失败: %s（配置仍已写入 config.json 和运行时）", path, exc)
+
+
 def load_config() -> Dict[str, Any]:
-    """读取持久化配置，合并默认值"""
+    """读取配置，优先级:
+    1. DEFAULT_CONFIG（内置默认）
+    2. 系统环境变量 / .env（docker-compose 注入或部署时写入，启动时兜底）
+    3. review-web/data/config.json（Web 页面手动保存过的值，优先级最高）
+    """
     cfg = dict(DEFAULT_CONFIG)
+
+    # --- 第 2 层: 从环境变量和 .env 读取兜底值 ---
+    # 2a. os.environ 优先（docker compose up 时注入的已经在这里了）
+    for cfg_key, env_key, _to_env, from_env in ENV_CONFIG_MAP:
+        if env_key in os.environ:
+            cfg[cfg_key] = from_env(os.environ[env_key])
+    # 2b. 如果启动时环境变量里没有某些 KEY，再从 .env 文件补读（比如刚复制 .env.example 的场景）
+    env_path = _find_env_file()
+    env_rows = _parse_env_file(env_path)
+    env_file_kv: Dict[str, str] = {r["key"]: r["value"] for r in env_rows if r["type"] == "kv"}
+    for cfg_key, env_key, _to_env, from_env in ENV_CONFIG_MAP:
+        if cfg_key not in cfg or cfg[cfg_key] in (None, ""):
+            if env_key in env_file_kv and env_file_kv[env_key] != "":
+                cfg[cfg_key] = from_env(env_file_kv[env_key])
+    # proxy_port: 从 HTTP_PROXY 反推端口（如果 .env 里没写）
+    if not cfg.get("proxy_port"):
+        for k in ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"):
+            v = os.environ.get(k) or env_file_kv.get(k) or ""
+            if v:
+                try:
+                    from urllib.parse import urlparse
+                    port = urlparse(v).port
+                    if port:
+                        cfg["proxy_port"] = str(port)
+                        break
+                except Exception:
+                    pass
+
+    # --- 第 3 层: config.json 里用户手动保存的最高优先级 ---
     if CONFIG_FILE.exists():
         try:
             saved = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
@@ -93,22 +247,43 @@ def load_config() -> Dict[str, Any]:
 
 
 def save_config(cfg: Dict[str, Any]) -> None:
-    """保存配置到文件，并同步到环境变量 + 运行时"""
+    """保存配置：
+    1. 写入 config.json（Web 配置持久化）
+    2. 同步到 os.environ（当前进程及子进程立即生效）
+    3. 同步写入 .env 文件（下次 docker compose restart/up 后仍然生效）
+    4. 同步到 pipeline 模块运行时并发（无需重启进程）
+    """
+    # 1) 写 config.json
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-    # 同步到环境变量，供子进程使用
-    os.environ["ASR_BACKEND"] = cfg.get("asr_backend", "funasr")
-    os.environ["WHISPER_MODEL_SIZE"] = cfg.get("whisper_model_size", "large-v3")
-    os.environ["OPENAI_API_KEY"] = cfg.get("openai_api_key", "")
-    os.environ["OPENAI_API_BASE"] = cfg.get("openai_api_base", "https://api.deepseek.com/v1")
-    os.environ["OPENAI_MODEL"] = cfg.get("openai_model", "deepseek-chat")
-    os.environ["MODELSCOPE_CACHE"] = cfg.get("modelscope_cache", "")
+
+    # 2) 同步到 os.environ（+ 构建要写入 .env 的 updates 字典）
+    env_updates: Dict[str, str] = {}
+    for cfg_key, env_key, to_env, _from_env in ENV_CONFIG_MAP:
+        py_val = cfg.get(cfg_key)
+        str_val = to_env(py_val)
+        os.environ[env_key] = str_val
+        env_updates[env_key] = str_val
+
+    # proxy_port 单独处理
     proxy = cfg.get("proxy_port", "")
     if proxy:
-        os.environ["HTTP_PROXY"] = f"http://127.0.0.1:{proxy}"
-        os.environ["HTTPS_PROXY"] = f"http://127.0.0.1:{proxy}"
-        os.environ["NO_PROXY"] = "api.deepseek.com"
-        os.environ["no_proxy"] = "api.deepseek.com"
-    # ---- 并发/性能：同步到环境变量 + 运行时全局 ----
+        proxy_url = f"http://127.0.0.1:{proxy}"
+        for k in ("HTTP_PROXY", "HTTPS_PROXY"):
+            os.environ[k] = proxy_url
+            env_updates[k] = proxy_url
+        for k in ("NO_PROXY", "no_proxy"):
+            os.environ[k] = "api.deepseek.com,localhost,127.0.0.1"
+        env_updates["NO_PROXY"] = "api.deepseek.com,localhost,127.0.0.1"
+    else:
+        for k in ("HTTP_PROXY", "HTTPS_PROXY"):
+            os.environ.pop(k, None)
+            env_updates[k] = ""
+        for k in ("NO_PROXY", "no_proxy"):
+            os.environ.pop(k, None)
+        env_updates["NO_PROXY"] = ""
+
+    # 并发参数运行时修改
     try:
         mw = int(cfg.get("pipeline_max_workers", 2))
         ss = int(cfg.get("subtitle_remove_max_concurrency", 2))
@@ -118,7 +293,10 @@ def save_config(cfg: Dict[str, Any]) -> None:
     os.environ["PIPELINE_MAX_WORKERS"] = str(mw)
     os.environ["SUBTITLE_REMOVE_MAX_CONCURRENCY"] = str(ss)
     os.environ["SUBTITLE_EARLY_START"] = "true" if es else "false"
-    # 运行时修改已加载的 pipeline 模块
+    env_updates["PIPELINE_MAX_WORKERS"] = str(mw)
+    env_updates["SUBTITLE_REMOVE_MAX_CONCURRENCY"] = str(ss)
+    env_updates["SUBTITLE_EARLY_START"] = "true" if es else "false"
+
     try:
         pipeline_service.set_runtime_concurrency(
             max_workers=mw, subtitle_semaphore=ss, subtitle_early_start=es
@@ -126,8 +304,11 @@ def save_config(cfg: Dict[str, Any]) -> None:
     except AttributeError:
         pass
 
+    # 3) 同步写入 .env（保留注释、未知变量不变）
+    _write_env_file(_find_env_file(), env_updates)
 
-# 启动时加载配置
+
+# 启动时加载配置（会立刻把默认值写回 os.environ + .env）
 save_config(load_config())
 
 
